@@ -1,0 +1,239 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Adafruit_Fingerprint.h>
+
+#define RXD2 16
+#define TXD2 17
+
+HardwareSerial fingerSerial(2);
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&fingerSerial);
+
+/* 🔴 WIFI */
+const char* WIFI_SSID = "T4x";
+const char* WIFI_PASS = "zzxcvbnm";
+
+/* 🔴 SUPABASE */
+const char* SUPABASE_URL = "https://eqtpbqbacuoqmswavbez.supabase.co";
+const char* SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVxdHBicWJhY3VvcW1zd2F2YmV6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzAwNDM3NTYsImV4cCI6MjA4NTYxOTc1Nn0.311o2oFzNSzeej-s6ktBglTIP2CUWlLttMbtx0TdNng";
+
+uint16_t fingerID = 0;
+String userName = "";
+String userBranch = "";
+
+String readLine() {
+  while (Serial.available()) Serial.read();  // clear buffer
+  while (!Serial.available()) delay(10);
+  return Serial.readStringUntil('\n');
+}
+
+void setup() {
+  Serial.begin(115200);
+  fingerSerial.begin(57600, SERIAL_8N1, RXD2, TXD2);
+
+  connectWiFi();
+  initFingerprint();
+}
+
+void loop() {
+  Serial.println("\n1 → Enroll");
+  Serial.println("2 → Authenticate");
+
+  while (!Serial.available());
+  char choice = Serial.readStringUntil('\n').charAt(0);
+
+  if (choice == '1') enrollUser();
+  if (choice == '2') authenticateUser();
+
+  delay(2000);
+}
+
+/* ================= WIFI ================= */
+
+void connectWiFi() {
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connecting WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Connected");
+}
+
+/* ================= FINGERPRINT ================= */
+
+void initFingerprint() {
+  if (finger.verifyPassword()) {
+    Serial.println("Fingerprint sensor found");
+  } else {
+    Serial.println("Fingerprint sensor not found");
+    while (1);
+  }
+}
+
+/* ================= ENROLL ================= */
+
+void enrollUser() {
+  Serial.println("Enter User ID (number):");
+  fingerID = readLine().toInt();
+
+  Serial.println("Enter Name:");
+  userName = readLine();
+  userName.trim();
+
+  Serial.println("Enter Branch:");
+  userBranch = readLine();
+  userBranch.trim();
+  Serial.println("Waiting for finger to enroll...");
+
+  int p = -1;
+  while (p != FINGERPRINT_OK) {
+    p = finger.getImage();
+    delay(100);
+  }
+
+  if (finger.image2Tz(1) != FINGERPRINT_OK) {
+    Serial.println("Image conversion failed");
+    return;
+  }
+
+  Serial.println("Remove finger");
+  delay(2000);
+
+  // Wait until finger is removed
+  while (finger.getImage() != FINGERPRINT_NOFINGER) {
+    delay(100);
+  }
+
+  Serial.println("Place SAME finger again");
+
+  p = -1;
+  while (p != FINGERPRINT_OK) {
+    p = finger.getImage();
+    delay(100);
+  }
+
+  if (finger.image2Tz(2) != FINGERPRINT_OK) {
+    Serial.println("Second image failed");
+    return;
+  }
+
+  if (finger.createModel() != FINGERPRINT_OK) {
+    Serial.println("Finger mismatch");
+    return;
+  }
+
+  if (finger.storeModel(fingerID) == FINGERPRINT_OK) {
+    Serial.println("Enroll SUCCESS, ID = " + String(fingerID));
+    insertUserSupabase(fingerID, userName, userBranch);
+    fingerID++;
+  } else {
+    Serial.println("Store failed");
+  }
+}
+
+/* ================= AUTHENTICATE ================= */
+
+void authenticateUser() {
+  Serial.println("Waiting for finger to authenticate...");
+
+  int p = -1;
+  while (p != FINGERPRINT_OK) {
+    p = finger.getImage();
+    delay(100);
+  }
+
+  if (finger.image2Tz() != FINGERPRINT_OK) {
+    Serial.println("Image conversion failed");
+    return;
+  }
+
+  if (finger.fingerSearch() != FINGERPRINT_OK) {
+    Serial.println("No match found");
+    return;
+  }
+
+  uint16_t id = finger.fingerID;
+  Serial.print("Authenticated ID: ");
+  Serial.println(id);
+
+  fetchUserAndLogAttendance(id);
+}
+/* ================= SUPABASE ================= */
+
+void insertUserSupabase(int id, String name, String branch) {
+  HTTPClient http;
+  String url = String(SUPABASE_URL) + "/rest/v1/users";
+
+  StaticJsonDocument<200> doc;
+  doc["id"] = id;
+  doc["name"] = name;
+  doc["branch"] = branch;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  http.begin(url);
+  http.addHeader("apikey", SUPABASE_KEY);
+  http.addHeader("Authorization", "Bearer " + String(SUPABASE_KEY));
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Prefer", "return=minimal");
+
+  int code = http.POST(payload);
+  Serial.println("User insert status: " + String(code));
+
+  http.end();
+}
+
+void fetchUserAndLogAttendance(int id) {
+  HTTPClient http;
+  String url = String(SUPABASE_URL) +
+               "/rest/v1/users?id=eq." + String(id) +
+               "&select=name,branch";
+
+  http.begin(url);
+  http.addHeader("apikey", SUPABASE_KEY);
+  http.addHeader("Authorization", "Bearer " + String(SUPABASE_KEY));
+
+  int code = http.GET();
+
+  if (code == 200) {
+    String response = http.getString();
+
+    StaticJsonDocument<300> doc;
+    deserializeJson(doc, response);
+
+    String name = doc[0]["name"];
+    String branch = doc[0]["branch"];
+
+    insertAttendance(id, name, branch, "AUTHENTICATED");
+  }
+
+  http.end();
+}
+
+void insertAttendance(int id, String name, String branch, String status) {
+  HTTPClient http;
+  String url = String(SUPABASE_URL) + "/rest/v1/attendance";
+
+  StaticJsonDocument<300> doc;
+  doc["id"] = id;
+  doc["name"] = name;
+  doc["branch"] = branch;
+  doc["status"] = status;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  http.begin(url);
+  http.addHeader("apikey", SUPABASE_KEY);
+  http.addHeader("Authorization", "Bearer " + String(SUPABASE_KEY));
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Prefer", "return=minimal");
+
+  int code = http.POST(payload);
+  Serial.println("Attendance logged: " + String(code));
+
+  http.end();
+}
